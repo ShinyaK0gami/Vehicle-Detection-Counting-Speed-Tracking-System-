@@ -61,9 +61,6 @@ The board operates 100% headless (no monitor, keyboard, or mouse attached), stre
 ## Repository Structure
 
 ```text
-├──Dataset                    #This folder includes both Labelled and Unlabelled dataset
-          ├──Labelled Dataset
-          ├──Unlablled Dataset
 ├── best.engine               # Serialized TensorRT FP16 engine (YOLOv8, 416x416)
 ├── Test_Video.mp4            # Input video file (or camera source)
 ├── run_web_stream.py         # Multi-threaded inference pipeline and HTTP streaming server
