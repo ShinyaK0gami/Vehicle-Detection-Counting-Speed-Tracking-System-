@@ -1,14 +1,15 @@
-cat << 'EOF' > run_web_stream.py
 #!/usr/bin/env python3
 import time
 import math
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
 import cv2
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
-from flask import Flask, Response, render_template_string
 
 # ==================== CONFIGURATION ====================
 ENGINE_PATH = "best.engine"
@@ -21,12 +22,12 @@ WEB_PORT = 5000
 CLASSES = ["car", "truck", "trolley", "bus", "motorbike", "van"]
 
 CLASS_COLORS = {
-    "car":       (0, 255, 0),     # Bright Green
-    "truck":     (0, 140, 255),   # Orange
-    "trolley":   (255, 255, 0),   # Cyan
-    "bus":       (255, 60, 0),    # Deep Blue
-    "motorbike": (0, 255, 255),   # Bright Yellow
-    "van":       (220, 0, 255)    # Magenta
+    "car":       (0, 255, 0),
+    "truck":     (0, 140, 255),
+    "trolley":   (255, 255, 0),
+    "bus":       (255, 60, 0),
+    "motorbike": (0, 255, 255),
+    "van":       (220, 0, 255)
 }
 
 LINE_Y_RATIO = 0.65
@@ -38,9 +39,43 @@ def load_engine(engine_path):
     with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         return runtime.deserialize_cuda_engine(f.read())
 
-# Global buffer for threaded web streaming
-output_frame = None
-lock = threading.Lock()
+raw_frame = None
+raw_lock = threading.Lock()
+running = True
+
+annotated_frame = None
+annot_lock = threading.Lock()
+
+class BackgroundVideoCapture:
+    def __init__(self, source):
+        self.cap = cv2.VideoCapture(source)
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.fps <= 1.0 or math.isnan(self.fps):
+            self.fps = 30.0
+        self.running = True
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _reader_loop(self):
+        global raw_frame, raw_lock, running
+        while running and self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            with raw_lock:
+                raw_frame = frame
+            time.sleep(0.005)
+
+    def read_latest(self):
+        with raw_lock:
+            if raw_frame is None:
+                return False, None
+            return True, raw_frame.copy()
+
+    def release(self):
+        self.running = False
+        self.cap.release()
 
 class VehicleTracker:
     def __init__(self, max_lost=6, max_distance=65):
@@ -92,7 +127,6 @@ class VehicleTracker:
                 if len(obj["history"]) > 8:
                     obj["history"].pop(0)
 
-                # Perspective-calibrated velocity
                 if len(obj["history"]) >= 3:
                     p_old = obj["history"][0]
                     p_new = obj["history"][-1]
@@ -113,7 +147,6 @@ class VehicleTracker:
                         if 10.0 <= raw_speed <= 140.0:
                             obj["speed"] = 0.65 * obj["speed"] + 0.35 * raw_speed if obj["speed"] > 0 else raw_speed
 
-                # Tripwire Counting
                 if not obj["counted"]:
                     if (prev_cent[1] < line_y and cent[1] >= line_y) or (prev_cent[1] > line_y and cent[1] <= line_y):
                         cls_name = CLASSES[obj["cls_id"]]
@@ -166,9 +199,8 @@ def preprocess(img, target_size=416):
     return canvas, r
 
 def inference_worker():
-    global output_frame, lock
+    global annotated_frame, annot_lock, running
 
-    # Initialize PyCUDA context on this thread
     cuda_ctx = cuda.Device(0).make_context()
     engine = load_engine(ENGINE_PATH)
     context = engine.create_execution_context()
@@ -187,31 +219,19 @@ def inference_worker():
         else:
             outputs.append({"host": host_mem, "device": device_mem})
 
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
-    if not cap.isOpened():
-        print("Error opening video source:", VIDEO_SOURCE)
-        cuda_ctx.pop()
-        return
-
-    src_fps = cap.get(cv2.CAP_PROP_FPS)
-    if src_fps <= 1.0 or math.isnan(src_fps):
-        src_fps = 30.0
-    dt_per_frame = 1.0 / src_fps
+    reader = BackgroundVideoCapture(VIDEO_SOURCE)
+    dt_per_frame = 1.0 / reader.fps
 
     tracker = VehicleTracker(max_lost=6, max_distance=65)
     fps_smoothed = 0.0
     prev_time = time.perf_counter()
     frame_idx = 0
 
-    print("Background TensorRT worker active. Streaming ready.")
-
-    while True:
-        ret, frame = cap.read()
+    while running:
+        ret, frame = reader.read_latest()
         if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if not ret:
-                break
+            time.sleep(0.005)
+            continue
 
         frame_idx += 1
         frame_h, frame_w = frame.shape[:2]
@@ -228,22 +248,34 @@ def inference_worker():
         stream.synchronize()
         gpu_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Vectorized post-processing
         out = outputs[0]["host"].reshape((4 + len(CLASSES), -1)).T
-        boxes, confidences, class_ids = [], [], []
+        boxes_raw = out[:, :4]
+        scores_raw = out[:, 4:]
 
-        for row in out:
-            classes_scores = row[4:]
-            cls_id = np.argmax(classes_scores)
-            score = classes_scores[cls_id]
-            if score > CONF_THRESH:
-                cx, cy, w, h = row[0:4]
-                x1 = int((cx - w / 2) / ratio)
-                y1 = int((cy - h / 2) / ratio)
-                bw = int(w / ratio)
-                bh = int(h / ratio)
-                boxes.append([x1, y1, bw, bh])
-                confidences.append(float(score))
-                class_ids.append(cls_id)
+        class_ids_all = np.argmax(scores_raw, axis=1)
+        confidences_all = np.max(scores_raw, axis=1)
+        mask = confidences_all > CONF_THRESH
+
+        boxes, confidences, class_ids = [], [], []
+        if np.any(mask):
+            filtered_boxes = boxes_raw[mask]
+            filtered_confs = confidences_all[mask]
+            filtered_cls = class_ids_all[mask]
+
+            cx = filtered_boxes[:, 0]
+            cy = filtered_boxes[:, 1]
+            w = filtered_boxes[:, 2]
+            h = filtered_boxes[:, 3]
+
+            x1 = ((cx - w / 2.0) / ratio).astype(np.int32)
+            y1 = ((cy - h / 2.0) / ratio).astype(np.int32)
+            bw = (w / ratio).astype(np.int32)
+            bh = (h / ratio).astype(np.int32)
+
+            boxes = np.stack([x1, y1, bw, bh], axis=1).tolist()
+            confidences = filtered_confs.astype(float).tolist()
+            class_ids = filtered_cls.tolist()
 
         indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESH, IOU_THRESH)
         filtered_dets = []
@@ -253,12 +285,11 @@ def inference_worker():
 
         tracked_objects = tracker.update(filtered_dets, line_y, frame_idx, dt_per_frame, frame_h)
 
-        # 1. Tripwire
+        # Annotations
         cv2.line(frame, (0, line_y), (frame_w, line_y), (0, 220, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, "TRIPWIRE", (15, line_y - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1, cv2.LINE_AA)
 
-        # 2. Vehicle Boxes & Clean Labels
         for oid, obj in tracked_objects.items():
             if obj["lost"] > 0:
                 continue
@@ -277,7 +308,6 @@ def inference_worker():
             cv2.putText(frame, tag, (x + 3, tag_y - 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-        # 3. Performance HUD
         loop_time = curr_time - prev_time
         prev_time = curr_time
         current_fps = 1.0 / max(loop_time, 1e-5)
@@ -287,7 +317,6 @@ def inference_worker():
         cv2.putText(frame, "FPS: {:.1f}".format(fps_smoothed), (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
         cv2.putText(frame, "GPU: {:.1f} ms".format(gpu_ms), (18, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
 
-        # 4. Vehicle Counts Scoreboard
         panel_w = 160
         cv2.rectangle(frame, (frame_w - panel_w - 10, 10), (frame_w - 10, 30 + len(CLASSES) * 22), (20, 20, 20), -1)
         cv2.putText(frame, "COUNTS", (frame_w - panel_w + 5, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
@@ -299,20 +328,13 @@ def inference_worker():
             cv2.putText(frame, "{}:".format(cls_name.capitalize()), (frame_w - panel_w + 5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
             cv2.putText(frame, str(cnt), (frame_w - 38, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Encode to JPEG for web streaming
-        ret_enc, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-        if ret_enc:
-            with lock:
-                output_frame = jpeg.tobytes()
+        with annot_lock:
+            annotated_frame = frame
 
-    cap.release()
+    reader.release()
     cuda_ctx.pop()
 
-# ==================== FLASK SERVER ====================
-app = Flask(__name__)
-
-HTML_PAGE = """
-<!DOCTYPE html>
+HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
     <title>Jetson Nano Edge Telemetry</title>
@@ -334,29 +356,66 @@ HTML_PAGE = """
 </html>
 """
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_PAGE)
+class StreamingHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
 
-def generate_stream():
-    global output_frame, lock
-    while True:
-        with lock:
-            if output_frame is None:
-                time.sleep(0.01)
-                continue
-            frame_bytes = output_frame
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        time.sleep(0.02)
+    def do_GET(self):
+        global annotated_frame, annot_lock
+        if self.path == '/':
+            encoded = HTML_PAGE.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        elif self.path == '/video_feed':
+            self.send_response(200)
+            self.send_header('Age', '0')
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.end_headers()
+            try:
+                while True:
+                    with annot_lock:
+                        target = None if annotated_frame is None else annotated_frame.copy()
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+                    if target is None:
+                        time.sleep(0.01)
+                        continue
+
+                    stream_img = cv2.resize(target, (960, 540), interpolation=cv2.INTER_NEAREST)
+                    ret_enc, jpeg = cv2.imencode('.jpg', stream_img, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+                    if not ret_enc:
+                        continue
+
+                    frame_bytes = jpeg.tobytes()
+                    self.wfile.write(b'--FRAME\r\n')
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(len(frame_bytes)))
+                    self.end_headers()
+                    self.wfile.write(frame_bytes)
+                    self.wfile.write(b'\r\n')
+                    time.sleep(0.02)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+        else:
+            self.send_error(404)
+            self.end_headers()
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 if __name__ == '__main__':
     t = threading.Thread(target=inference_worker)
     t.daemon = True
     t.start()
-    app.run(host='0.0.0.0', port=WEB_PORT, debug=False, threaded=True)
-EOF
+    
+    server = ThreadedHTTPServer(('0.0.0.0', WEB_PORT), StreamingHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        running = False
+        server.server_close()
