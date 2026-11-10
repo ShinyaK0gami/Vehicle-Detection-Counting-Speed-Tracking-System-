@@ -6,6 +6,10 @@ The board operates 100% headless (no monitor, keyboard, or mouse attached), stre
 
 ---
 
+<img src="image_assets/Jetson.png" alt="App Screenshot" width="500">
+
+<img src="image_assets/Inference.png" alt="App Screenshot" width="500">
+
 ## System Architecture
 
 ```
