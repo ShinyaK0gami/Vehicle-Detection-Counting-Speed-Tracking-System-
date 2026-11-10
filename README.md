@@ -62,10 +62,12 @@ The board operates 100% headless (no monitor, keyboard, or mouse attached), stre
 
 ```text
 ├── best.engine               # Serialized TensorRT FP16 engine (YOLOv8, 416x416)
-├── Test_Video.mp4            # Input video file (or camera source)
+├── Dataset                   #This folder includes both labelled and unlablled datasets
+    ├──Labelled Dataset
+    ├──Unlablled Dataset
 ├── run_web_stream.py         # Multi-threaded inference pipeline and HTTP streaming server
 ├── start_pipeline.sh         # Shell script executing inside Jetson to launch Docker
-├── Start_Jetson.bat          # 1-click Windows client launcher script
+├── Run_Jetson.bat          # 1-click Windows client launcher script
 └── README.md                 # Project documentation
 ```
 
