@@ -6,8 +6,9 @@ The board operates 100% headless (no monitor, keyboard, or mouse attached), stre
 
 ---
 
-<img src="image_assets/Jetson.jpg" alt="App Screenshot" width="215">                           <img src="image_assets/Inference.jpeg" alt="App Screenshot" width="500">
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<img src="image_assets/Jetson.jpg" alt="App Screenshot" width="215">    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;                       <img src="image_assets/Inference.jpeg" alt="App Screenshot" width="500">
 
+&nbsp;&nbsp;&nbsp;Fig1: Jetson Nano Setup.  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;   Fig2: Inference Captured Image
 
 
 ## System Architecture
