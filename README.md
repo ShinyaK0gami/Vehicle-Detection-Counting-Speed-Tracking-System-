@@ -81,7 +81,7 @@ The board operates 100% headless (no monitor, keyboard, or mouse attached), stre
 ## Hardware & Environment Requirements
 
 * **Edge Device:** NVIDIA Jetson Nano Developer Kit (2GB or 4GB)
-* **Power Source:** 5V⎓4A barrel jack power supply recommended (with J48 jumper connected)
+* **Power Source:** 5V⎓4A USB C power supply recommended
 * **Client Host:** Laptop or PC with an RJ-45 Ethernet port (or USB-to-Ethernet adapter)
 * **Physical Link:** Standard Cat5e / Cat6 Ethernet patch cable
 * **OS / Environment:** JetPack 4.6.1 (L4T R32.7.1) / Ubuntu 18.04 LTS (CLI-only mode)
